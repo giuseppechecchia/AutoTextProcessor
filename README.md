@@ -1,6 +1,22 @@
 # AutoTextProcessor
 An example of a poorly written documents parser in C to demonstrate that it could be done
 
+## Compilation Instructions
+
+To compile the `document_parser` program, use the following command:
+
+```sh
+gcc -o document_parser document_parser.c -lsqlite3 -lpthread -lcurl -lcjson
+```
+
+This command will generate an executable named `document_parser` by linking the necessary libraries:
+
+- `-lsqlite3`: Links the SQLite3 library for database interactions.
+- `-lpthread`: Links the POSIX threads library for multithreading.
+- `-lcurl`: Links the cURL library for handling HTTP requests.
+- `-lcjson`: Links the cJSON library for JSON parsing and manipulation.
+
+
 ## TODO
 
 - [ ] **Securely Handle API Keys**
