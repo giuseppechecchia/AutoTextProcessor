@@ -14,13 +14,17 @@
 #include <cjson/cJSON.h> 
 #include <iconv.h>
 
-#define OPENAI_API_KEY ""
+#define DEFAULT_OPENAI_API_KEY ""
+#define DEFAULT_WATCH_PATH ""
+#define DEFAULT_TEMP_IMAGE_DIR "/tmp/pdf_images"
+
+#define OPENAI_API_KEY (getenv("OPENAI_API_KEY") ? getenv("OPENAI_API_KEY") : DEFAULT_OPENAI_API_KEY)
+#define WATCH_PATH (getenv("WATCH_PATH") ? getenv("WATCH_PATH") : DEFAULT_WATCH_PATH)
+#define TEMP_IMAGE_DIR (getenv("WATCH_PATH") ? getenv("WATCH_PATH") : DEFAULT_TEMP_IMAGE_DIR)
+
+
 #define MAX_TEXT_LENGTH 3500
-
-
 #define EVENT_BUF_LEN (1024 * (sizeof(struct inotify_event) + 16))
-#define WATCH_PATH ""
-#define TEMP_IMAGE_DIR "/tmp/pdf_images"
 #define MAX_RETRIES 5
 #define RETRY_DELAY 100000  // 100 ms
 
@@ -161,7 +165,12 @@ char* call_openai_api(const char *text) {
 
         struct curl_slist *headers = NULL;
         headers = curl_slist_append(headers, "Content-Type: application/json");
-        headers = curl_slist_append(headers, "Authorization: Bearer " OPENAI_API_KEY);
+
+        // Costruisci l'header Authorization con la chiave API
+        char auth_header[256];
+        snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", OPENAI_API_KEY);
+        headers = curl_slist_append(headers, auth_header);
+
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
 
         char json_data[4096];
@@ -201,6 +210,7 @@ char* call_openai_api(const char *text) {
 
     return NULL;
 }
+
 
 void start_thread_for_file(const char *filepath) {
     pthread_t thread;
@@ -569,7 +579,13 @@ void *process_file(void *arg) {
 void parse_pdf_file(const char *filepath) {
     char temp_dir[1024];
     snprintf(temp_dir, sizeof(temp_dir), "%s/%lx", TEMP_IMAGE_DIR, hash(filepath));
-    mkdir(temp_dir, 0777);
+    // mkdir(temp_dir, 0777);
+    if (mkdir(temp_dir, 0777) != 0) {
+        perror("Error creating temp directory");
+    return;
+    } else {
+        printf("Created directory: %s\n", temp_dir);
+    }
 
     char command[1024];
     snprintf(command, sizeof(command), "pdftoppm '%s' %s/outputfile -png", filepath, temp_dir);
@@ -825,6 +841,16 @@ void delete_file(const char *filepath) {
 }
 
 int main() {
+
+    if (OPENAI_API_KEY != NULL && WATCH_PATH != NULL && TEMP_IMAGE_DIR != NULL) {
+        printf("OPENAI_API_KEY: %s\n", OPENAI_API_KEY);
+        printf("WATCH_PATH: %s\n", WATCH_PATH);
+        printf("TEMP_IMAGE_DIR: %s\n", TEMP_IMAGE_DIR);
+    } else {
+        printf("Errore: variabili d'ambiente non trovate.\n");
+        return 0;
+    }
+
     init_db(&db);  // Inizializza la connessione al database globale
 
     int fd = inotify_init();

@@ -12,10 +12,19 @@ if ! is_installed "unrtf"; then
     sudo apt-get install -y unrtf
 fi
 
-sudo apt-get install -y libcurl4-openssl-dev
-sudo apt-get install -y libcjson-dev
+# Installazione di libcurl4-openssl-dev
+if ! is_installed "libcurl4-openssl-dev"; then
+    echo "Installazione di libcurl4-openssl-dev..."
+    sudo apt-get update
+    sudo apt-get install -y libcurl4-openssl-dev
+fi
 
-
+# Installazione di libcjson-dev
+if ! is_installed "libcjson-dev"; then
+    echo "Installazione di libcjson-dev..."
+    sudo apt-get update
+    sudo apt-get install -y libcjson-dev
+fi
 
 # Installazione di antiword per la gestione dei file DOC
 if ! is_installed "antiword"; then
@@ -60,3 +69,18 @@ if ! is_installed "convert"; then
 fi
 
 echo "Tutte le dipendenze sono state installate correttamente."
+
+START_DIR="$(pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# Compila il programma C utilizzando il percorso assoluto
+gcc -o document_parser "$SCRIPT_DIR/document_parser.c" -lsqlite3 -lpthread -lcurl -lcjson
+
+if [ $? -eq 0 ]; then
+    echo "Compilazione completata con successo."
+else
+    echo "Errore durante la compilazione."
+    cd "$START_DIR"
+    exit 1
+fi
