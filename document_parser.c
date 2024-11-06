@@ -13,24 +13,29 @@
 #include <curl/curl.h>
 #include <cjson/cJSON.h> 
 #include <iconv.h>
+#include <stdbool.h>
 
 #define DEFAULT_OPENAI_API_KEY ""
 #define DEFAULT_WATCH_PATH ""
-#define DEFAULT_TEMP_IMAGE_DIR "/tmp/pdf_images"
+#define DEFAULT_TEMP_IMAGE_DIR ""
 
 #define OPENAI_API_KEY (getenv("OPENAI_API_KEY") ? getenv("OPENAI_API_KEY") : DEFAULT_OPENAI_API_KEY)
 #define WATCH_PATH (getenv("WATCH_PATH") ? getenv("WATCH_PATH") : DEFAULT_WATCH_PATH)
-#define TEMP_IMAGE_DIR (getenv("WATCH_PATH") ? getenv("WATCH_PATH") : DEFAULT_TEMP_IMAGE_DIR)
-
+#define TEMP_IMAGE_DIR (getenv("TEMP_IMAGE_DIR") ? getenv("TEMP_IMAGE_DIR") : DEFAULT_TEMP_IMAGE_DIR)
 
 #define MAX_TEXT_LENGTH 3500
 #define EVENT_BUF_LEN (1024 * (sizeof(struct inotify_event) + 16))
 #define MAX_RETRIES 5
 #define RETRY_DELAY 100000  // 100 ms
+#define MAX_FILES 1024
 
-// Mutex per la sincronizzazione dell'accesso al database
+// Mutex for synchronizing database access
 pthread_mutex_t db_mutex = PTHREAD_MUTEX_INITIALIZER;
-sqlite3 *db = NULL;  // Connessione globale al database
+pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Global database connection
+sqlite3 *db = NULL;
+
 
 // Function prototypes
 void parse_txt_file(const char *filepath);
@@ -39,32 +44,37 @@ void parse_pdf_file(const char *filepath);
 void parse_doc_file(const char *filepath);
 int has_valid_extension(const char *filename);
 void delete_file(const char *filepath);
-void log_message(const char *message);
+void log_message(const char *level, const char *message, ...);
 void init_db(sqlite3 **db);
 int should_process_file(sqlite3 *db, const char *filename, int file_size_kb);
 int save_to_db(sqlite3 *db, const char *filename, const char *text, const char *operation_time, const char *last_modified_time, int file_size_kb);
-void sanitize_text(char *text);  // Aggiunta della dichiarazione
+void sanitize_text(char *text);
 char* sanitize_and_validate_text(char *text);
 char* call_openai_api(const char *text);
 
+// Structure to hold file path data for thread processing
 typedef struct {
     char filepath[1024];
 } thread_data_t;
 
 void *process_file(void *arg);
 
+// Structure to manage memory during HTTP response handling
 struct MemoryStruct {
     char *memory;
     size_t size;
 };
 
+
 static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t realsize = size * nmemb;
     struct MemoryStruct *mem = (struct MemoryStruct *)userp;
 
+    // Use a temporary pointer to avoid memory leak if realloc fails
     char *ptr = realloc(mem->memory, mem->size + realsize + 1);
-    if(ptr == NULL) {
+    if (ptr == NULL) {
         printf("not enough memory (realloc returned NULL)\n");
+        free(mem->memory);  // Free the previously allocated memory
         return 0;
     }
 
@@ -107,16 +117,24 @@ char* parse_openai_response(const char *json_response) {
         return NULL;
     }
 
+    // strdup check to handle potential memory allocation failure
     char *summary = strdup(content->valuestring);
+    if (summary == NULL) {
+        fprintf(stderr, "Error duplicating content string\n");
+        cJSON_Delete(json);
+        return NULL;
+    }
+
     cJSON_Delete(json);
     return summary;
 }
 
+
 char* escape_json_string(const char *input) {
     size_t length = strlen(input);
-    size_t escaped_length = length * 2 + 1; // Allocate enough space
+    size_t escaped_length = length * 2 + 1; // Allocate enough space for the escaped string
     char *escaped = malloc(escaped_length);
-    if (!escaped) return NULL;
+    if (!escaped) return NULL;  // Return NULL if memory allocation fails
 
     const char *p = input;
     char *q = escaped;
@@ -134,10 +152,11 @@ char* escape_json_string(const char *input) {
         }
         p++;
     }
-    *q = '\0';
-    printf("Escaped string: %s\n", escaped);
-    return escaped;
+    *q = '\0';  // Null-terminate the escaped string
+    printf("Escaped string: %s\n", escaped);  // Optional for debugging
+    return escaped;  // The caller is responsible for freeing this memory
 }
+
 
 char* call_openai_api(const char *text) {
     CURL *curl;
@@ -145,6 +164,10 @@ char* call_openai_api(const char *text) {
 
     struct MemoryStruct chunk;
     chunk.memory = malloc(1);
+    if (chunk.memory == NULL) {
+        fprintf(stderr, "Failed to allocate memory for chunk\n");
+        return NULL;
+    }
     chunk.size = 0;
 
     char truncated_text[MAX_TEXT_LENGTH + 1];
@@ -154,6 +177,7 @@ char* call_openai_api(const char *text) {
     char *escaped_text = escape_json_string(truncated_text);
     if (!escaped_text) {
         fprintf(stderr, "Failed to escape JSON string\n");
+        free(chunk.memory);  // Make sure to free previously allocated memory
         return NULL;
     }
 
@@ -166,7 +190,6 @@ char* call_openai_api(const char *text) {
         struct curl_slist *headers = NULL;
         headers = curl_slist_append(headers, "Content-Type: application/json");
 
-        // Costruisci l'header Authorization con la chiave API
         char auth_header[256];
         snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", OPENAI_API_KEY);
         headers = curl_slist_append(headers, auth_header);
@@ -191,7 +214,7 @@ char* call_openai_api(const char *text) {
 
         if(res != CURLE_OK) {
             fprintf(stderr, "curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
-            free(chunk.memory);
+            free(chunk.memory);  // Ensure memory is freed in case of failure
             chunk.memory = NULL;
         }
 
@@ -204,26 +227,72 @@ char* call_openai_api(const char *text) {
 
     if (chunk.memory) {
         char *summary = escape_json_string(parse_openai_response(chunk.memory));
-        free(chunk.memory);  // Libera la memoria dell'intera risposta JSON
-        return summary;      // Restituisce solo il riassunto estratto
+        if (!summary) {
+            fprintf(stderr, "Failed to escape summary\n");
+            free(chunk.memory);  // Ensure memory is freed if parsing fails
+            return NULL;
+        }
+        free(chunk.memory);  // Free the entire JSON response memory
+        return summary;      // Return only the extracted summary
     }
 
     return NULL;
 }
 
 
+
 void start_thread_for_file(const char *filepath) {
     pthread_t thread;
     thread_data_t *data = malloc(sizeof(thread_data_t));
+    if (data == NULL) {
+        fprintf(stderr, "Failed to allocate memory for thread data\n");
+        return;
+    }
     strcpy(data->filepath, filepath);
-    pthread_create(&thread, NULL, process_file, data);
-    pthread_detach(thread);
+    
+    if (pthread_create(&thread, NULL, process_file, data) != 0) {
+        fprintf(stderr, "Failed to create thread for file processing\n");
+        free(data);  // Free memory if thread creation fails
+    } else {
+        pthread_detach(thread);  // Detach the thread so it can clean up after itself
+    }
 }
 
 int trace_callback(unsigned int trace_type, void *ctx, void *p, void *x) {
     const char *sql = (const char *)x;
     printf("Executing SQL: %s\n", sql);
-    return 0;  // Restituisce 0 per indicare che la traccia è stata gestita correttamente
+    return 0;  // Returns 0 to indicate the trace was handled successfully
+}
+
+void open_db(sqlite3 **db) {
+    int rc = sqlite3_open("text_extractor.db", db);
+    if (rc) {
+        fprintf(stderr, "Can't open database: %s\n", sqlite3_errmsg(*db));
+        exit(EXIT_FAILURE);
+    }
+
+    // Imposta la modalità di tracciamento per il debugging
+    sqlite3_trace_v2(*db, SQLITE_TRACE_STMT, trace_callback, NULL);
+
+    // Forza la codifica UTF-8
+    char *errmsg = 0;
+    rc = sqlite3_exec(*db, "PRAGMA encoding = 'UTF-8';", 0, 0, &errmsg);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Failed to set UTF-8 encoding: %s\n", errmsg);
+        sqlite3_free(errmsg);  // Libera la memoria allocata per i messaggi di errore
+        sqlite3_close(*db);    // Assicurati di chiudere il database in caso di errore
+        exit(EXIT_FAILURE);
+    }
+
+    // Abilita la modalità WAL per una migliore concorrenza
+    rc = sqlite3_exec(*db, "PRAGMA journal_mode=WAL;", 0, 0, &errmsg);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Failed to set WAL mode: %s\n", errmsg);
+        sqlite3_free(errmsg);
+        sqlite3_close(*db);
+        exit(EXIT_FAILURE);
+    }
+    sqlite3_free(errmsg);  // Libera errmsg dopo l'esecuzione con successo
 }
 
 void init_db(sqlite3 **db) {
@@ -235,20 +304,27 @@ void init_db(sqlite3 **db) {
 
     sqlite3_trace_v2(*db, SQLITE_TRACE_STMT, trace_callback, NULL);
 
-    // Forza l'encoding UTF-8
+    // Force UTF-8 encoding
     char *errmsg = 0;
     rc = sqlite3_exec(*db, "PRAGMA encoding = 'UTF-8';", 0, 0, &errmsg);
     if (rc != SQLITE_OK) {
         fprintf(stderr, "Failed to set UTF-8 encoding: %s\n", errmsg);
+        sqlite3_free(errmsg);  // Free memory allocated by SQLite for error messages
+        sqlite3_close(*db);    // Ensure database is closed in case of error
+        exit(EXIT_FAILURE);
+    }
+
+    // Enable WAL mode for better concurrency
+    rc = sqlite3_exec(*db, "PRAGMA journal_mode=WAL;", 0, 0, &errmsg);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Failed to set WAL mode: %s\n", errmsg);
         sqlite3_free(errmsg);
         sqlite3_close(*db);
         exit(EXIT_FAILURE);
     }
+    sqlite3_free(errmsg);  // Make sure to free errmsg after successful execution
 
-    // Abilita WAL mode per migliorare la concorrenza
-    sqlite3_exec(*db, "PRAGMA journal_mode=WAL;", 0, 0, 0);
-
-    // Creazione della tabella con le nuove colonne 'imported' e 'resume'
+    // Create table with additional columns 'imported' and 'resume'
     char *sql = "CREATE TABLE IF NOT EXISTS extracted_text ("
                 "id INTEGER PRIMARY KEY AUTOINCREMENT,"
                 "filename TEXT NOT NULL,"
@@ -262,12 +338,13 @@ void init_db(sqlite3 **db) {
     rc = sqlite3_exec(*db, sql, 0, 0, &errmsg);
     if (rc != SQLITE_OK) {
         fprintf(stderr, "SQL error: %s\n", errmsg);
-        sqlite3_free(errmsg);
+        sqlite3_free(errmsg);  // Free error message memory
         sqlite3_close(*db);
         exit(EXIT_FAILURE);
     }
+    sqlite3_free(errmsg);  // Free errmsg after successful execution
 
-    // Creazione degli indici per migliorare le prestazioni
+    // Create indexes for better performance
     sql = "CREATE INDEX IF NOT EXISTS idx_filename ON extracted_text(filename);"
           "CREATE INDEX IF NOT EXISTS idx_operation_time ON extracted_text(operation_time);"
           "CREATE INDEX IF NOT EXISTS idx_imported ON extracted_text(imported);";
@@ -279,37 +356,67 @@ void init_db(sqlite3 **db) {
         sqlite3_close(*db);
         exit(EXIT_FAILURE);
     }
+    sqlite3_free(errmsg);  // Free errmsg after successful execution
+}
+
+void close_db(sqlite3 *db) {
+    if (db) {
+        // Checkpoint the WAL file to write any remaining transactions to the main database
+        int rc = sqlite3_wal_checkpoint(db, NULL);
+        if (rc != SQLITE_OK) {
+            fprintf(stderr, "Failed to checkpoint WAL: %s\n", sqlite3_errmsg(db));
+        }
+
+        // Close the database connection
+        rc = sqlite3_close(db);
+        if (rc != SQLITE_OK) {
+            fprintf(stderr, "Failed to close the database: %s\n", sqlite3_errmsg(db));
+        } else {
+            printf("Database closed successfully.\n");
+        }
+    }
 }
 
 
 int should_process_file(sqlite3 *db, const char *filename, int file_size_kb) {
-    pthread_mutex_lock(&db_mutex);  // Acquisisci il mutex
+    pthread_mutex_lock(&db_mutex);  // Acquire the mutex
 
-    char *sql = "SELECT COUNT(*) FROM extracted_text WHERE filename = ? AND file_size_kb = ?;";
+    const char *sql = "SELECT COUNT(*) FROM extracted_text WHERE filename = ? AND file_size_kb = ?;";
     sqlite3_stmt *stmt;
-    sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
+    int result = 0;
+
+    // Prepare the SQL statement
+    int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(db));
+        pthread_mutex_unlock(&db_mutex);  // Ensure the mutex is unlocked
+        return 0;  // Return 0 to indicate that the file should not be processed
+    }
+
+    // Bind the parameters to the SQL query
     sqlite3_bind_text(stmt, 1, filename, -1, SQLITE_STATIC);
     sqlite3_bind_int(stmt, 2, file_size_kb);
     
-    int result = 0;
+    // Execute the query and check the result
     if (sqlite3_step(stmt) == SQLITE_ROW) {
-        result = sqlite3_column_int(stmt, 0) == 0;
+        result = sqlite3_column_int(stmt, 0) == 0;  // If count is 0, process the file
     }
+
+    // Finalize the statement to release resources
     sqlite3_finalize(stmt);
 
-    pthread_mutex_unlock(&db_mutex);  // Rilascia il mutex
+    pthread_mutex_unlock(&db_mutex);  // Release the mutex
     return result;
 }
 
-
 void preprocess_text(char *text) {
-    // Log del testo originale
+    // Log the original text (for debugging purposes)
     printf("Original text: \n%s\n", text);
 
-    // Rimozione degli spazi bianchi multipli
+    // Remove multiple spaces
     char *src = text, *dst = text;
     while (*src) {
-        // Rimuovi spazi bianchi multipli
+        // Skip over multiple spaces
         while (isspace(*src) && isspace(*(src + 1))) {
             src++;
         }
@@ -317,16 +424,16 @@ void preprocess_text(char *text) {
     }
     *dst = '\0';
 
-    // Log dopo la rimozione degli spazi bianchi multipli
+    // Log after removing extra spaces (for debugging purposes)
     printf("Text after removing extra spaces: \n%s\n", text);
 
-    // Rimuovi pattern sensibili tramite regex
+    // Remove sensitive patterns using regex
     const char *patterns[] = {
         "[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}",  // Email
         "\\b[A-Z]{2}[0-9]{2}[A-Z0-9]{1,30}\\b",             // IBAN
         "\\b[A-Z0-9]{8,11}\\b",                             // SWIFT Code
-        "\\b[0-9]{10,15}\\b",                               // Numeri di telefono (generic)
-        "\\b[A-Z]{6}[A-Z0-9]{2}[A-Z0-9]{7}\\b",             // Codice Fiscale (Italia)
+        "\\b[0-9]{10,15}\\b",                               // Phone numbers (generic)
+        "\\b[A-Z]{6}[A-Z0-9]{2}[A-Z0-9]{7}\\b",             // Codice Fiscale (Italy)
         "\\b[0-9]{3}-[0-9]{2}-[0-9]{4}\\b",                 // Social Security Number (USA)
         "\\b[0-9]{5,15}\\b"                                 // Insurance Numbers (generic)
     };
@@ -334,49 +441,61 @@ void preprocess_text(char *text) {
     regex_t regex;
     for (int i = 0; i < sizeof(patterns) / sizeof(patterns[0]); i++) {
         if (regcomp(&regex, patterns[i], REG_EXTENDED) != 0) {
-            continue;  // Se la regex non può essere compilata, passa al prossimo pattern
+            // Log the error if the regex compilation fails
+            fprintf(stderr, "Failed to compile regex pattern: %s\n", patterns[i]);
+            continue;
         }
 
         regmatch_t match;
         while (regexec(&regex, text, 1, &match, 0) == 0) {
-            // Sostituisci il match con spazi vuoti
+            // Replace the matched text with spaces
             memset(text + match.rm_so, ' ', match.rm_eo - match.rm_so);
         }
         regfree(&regex);
     }
 
-    // Log del testo dopo il preprocessamento completo
+    // Log the text after complete preprocessing (for debugging purposes)
     printf("Text after preprocessing: \n%s\n", text);
 }
 
+
 char* process_and_summarize_text(const char *preprocessed_text) {
-    // Step 1: Seleziona una frase ogni 3
+    // Step 1: Select every fourth sentence
     char selected_text[5001] = "";
+    char *selected_ptr = selected_text;  // Pointer to track the current position in selected_text
     int sentence_count = 0;
-    char *sentence_start = (char *)preprocessed_text;
-    char *sentence_end;
+    const char *sentence_start = preprocessed_text;
+    const char *sentence_end;
     
     while ((sentence_end = strstr(sentence_start, ".")) != NULL) {
         sentence_count++;
         if (sentence_count % 4 == 0) {
-            strncat(selected_text, sentence_start, sentence_end - sentence_start + 1);
-            if (strlen(selected_text) >= 5000) {
+            size_t sentence_length = sentence_end - sentence_start + 1;
+            
+            // Check if the next sentence can fit into the buffer
+            if ((selected_ptr - selected_text) + sentence_length >= 5000) {
                 selected_text[5000] = '\0';
                 break;
             }
+            
+            // Copy the sentence into selected_text
+            strncpy(selected_ptr, sentence_start, sentence_length);
+            selected_ptr += sentence_length;
+            *selected_ptr = '\0';  // Null-terminate the string after each addition
         }
         sentence_start = sentence_end + 1;
     }
 
-    // Step 2: Chiamata a OpenAI per ottenere un riassunto
+    // Step 2: Call OpenAI API to get a summary
     char *summary = call_openai_api(selected_text);
     if (summary == NULL) {
-        fprintf(stderr, "Error getting summary from OpenAI\n");
+        fprintf(stderr, "Error getting summary from OpenAI for text: %s\n", selected_text);
         return NULL;
     }
 
-    return summary;  // Restituisce il riassunto
+    return summary;  // Return the summary
 }
+
 
 char *validate_utf8(const char *input) {
     iconv_t cd = iconv_open("UTF-8", "UTF-8");
@@ -386,30 +505,42 @@ char *validate_utf8(const char *input) {
     }
 
     size_t inbytesleft = strlen(input);
-    size_t outbytesleft = inbytesleft * 2;
+    size_t outbytesleft = inbytesleft * 2;  // Double the space for the output buffer
     char *output = malloc(outbytesleft);
+    if (output == NULL) {
+        perror("malloc failed for output buffer");
+        iconv_close(cd);
+        return NULL;
+    }
+    
     char *outbuf = output;
-
     char *inbuf = (char *)input;
 
+    // Perform the conversion
     if (iconv(cd, &inbuf, &inbytesleft, &outbuf, &outbytesleft) == (size_t)-1) {
-        perror("iconv failed");
-        free(output);
+        perror("iconv conversion failed");
+        free(output);  // Free allocated memory in case of error
         iconv_close(cd);
         return NULL;
     }
 
     iconv_close(cd);
-    *outbuf = '\0';
-    return output;
+    *outbuf = '\0';  // Null-terminate the output string
+    return output;   // The caller must free the returned memory
 }
 
+
 char* sanitize_and_validate_text(char *text) {
-    sanitize_text(text);
+    sanitize_text(text);  // Sanitize the text by removing non-printable characters
+
     char *validated_text = validate_utf8(text);
     if (validated_text == NULL) {
-        return text;  // Se la validazione fallisce, ritorna il testo originale.
+        // If validation fails, return the original text.
+        return text;
     }
+
+    // If the validation succeeds, return the validated text.
+    // The caller should free the returned text if it is different from the original.
     return validated_text;
 }
 
@@ -421,8 +552,9 @@ void sanitize_text(char *text) {
         }
         src++;
     }
-    *dst = '\0';
+    *dst = '\0';  // Null-terminate the sanitized text
 }
+
 
 int save_to_db(sqlite3 *db, const char *filename, const char *text, const char *operation_time, const char *last_modified_time, int file_size_kb) {
     printf("Saving to database...\n");
@@ -432,40 +564,47 @@ int save_to_db(sqlite3 *db, const char *filename, const char *text, const char *
     printf("Last modified time: %s\n", last_modified_time);
     printf("File size KB: %d\n", file_size_kb);
 
-    // Duplica il testo per renderlo modificabile
+    // Duplicate text for modification
     char *modifiable_text = strdup(text);
     if (modifiable_text == NULL) {
         fprintf(stderr, "Failed to allocate memory for modifiable_text.\n");
         return -1;
     }
 
-    // Sanificazione del testo
-    sanitize_text(modifiable_text);   // Rimuove solo i caratteri di escape e non stampabili
+    // Sanitize the text
+    sanitize_text(modifiable_text);
     char *validated_text = validate_utf8(modifiable_text);
     if (validated_text == NULL) {
         fprintf(stderr, "Validation failed, skipping save.\n");
         free(modifiable_text);
         return -1;
     }
-    // Inserisci il testo nel database
+
+    // Attempt to insert into database with retry mechanism
     int retries = 0;
     int rc;
-
     while (retries < MAX_RETRIES) {
         pthread_mutex_lock(&db_mutex);
 
         char *sql = "INSERT INTO extracted_text (filename, text, operation_time, last_modified_time, file_size_kb, imported, resume) VALUES (?, ?, ?, ?, ?, ?, ?);";
         sqlite3_stmt *stmt;
 
-        sqlite3_prepare_v2(db, sql, -1, &stmt, 0);
+        if (sqlite3_prepare_v2(db, sql, -1, &stmt, 0) != SQLITE_OK) {
+            fprintf(stderr, "Failed to prepare statement: %s\n", sqlite3_errmsg(db));
+            pthread_mutex_unlock(&db_mutex);
+            free(validated_text);
+            free(modifiable_text);
+            return -1;
+        }
+
         sqlite3_bind_text(stmt, 1, filename, -1, SQLITE_STATIC);
         sqlite3_bind_text(stmt, 2, validated_text, -1, SQLITE_STATIC);
         sqlite3_bind_text(stmt, 3, operation_time, -1, SQLITE_STATIC);
         sqlite3_bind_text(stmt, 4, last_modified_time, -1, SQLITE_STATIC);
         sqlite3_bind_int(stmt, 5, file_size_kb);
-        sqlite3_bind_int(stmt, 6, 0);  // Valorizza la colonna imported con 0
+        sqlite3_bind_int(stmt, 6, 0);  // Set 'imported' column to 0
 
-        // Riassunto usando OpenAI (opzionale)
+        // Optional: Get summary using OpenAI
         char *summary = process_and_summarize_text(validated_text);
         if (summary != NULL) {
             printf("Inserting into DB: %s\n", summary);
@@ -481,35 +620,39 @@ int save_to_db(sqlite3 *db, const char *filename, const char *text, const char *
             printf("Database insertion successful.\n");
             sqlite3_finalize(stmt);
             pthread_mutex_unlock(&db_mutex);
-            free(validated_text);  // Libera la memoria del testo validato
-            free(modifiable_text); // Libera la memoria del testo modificabile
+            free(validated_text);  // Free memory for validated text
+            free(modifiable_text); // Free memory for modifiable text
             return 0;
         } else {
             fprintf(stderr, "SQL error during insertion: %s\n", sqlite3_errmsg(db));
             sqlite3_finalize(stmt);
             pthread_mutex_unlock(&db_mutex);
             retries++;
-            usleep(RETRY_DELAY);
+            usleep(RETRY_DELAY);  // Delay before retry
         }
     }
 
-    free(validated_text);  // Assicurati di liberare anche in caso di errore
-    free(modifiable_text); // Assicurati di liberare anche in caso di errore
+    // Cleanup on failure
+    free(validated_text);  // Ensure memory is freed
+    free(modifiable_text); // Ensure memory is freed
     printf("Failed to save to database after %d retries\n", retries);
     return -1;
 }
 
 
-
-
 int is_blank_page(const char *text) {
-    for (int i = 0; text[i] != '\0'; i++) {
-        if (!isspace(text[i])) {
-            return 0;
+    // Traverse through the string
+    while (*text) {
+        // Check if the current character is not a whitespace
+        if (!isspace((unsigned char)*text)) {
+            return 0;  // Found a non-whitespace character
         }
+        text++;
     }
-    return 1;
+    return 1;  // All characters are whitespace or the string is empty
 }
+
+
 
 void parse_txt_file(const char *filepath) {
     FILE *file = fopen(filepath, "r");
@@ -526,7 +669,7 @@ void parse_txt_file(const char *filepath) {
     int file_size_kb = attr.st_size / 1024;
 
     if (!should_process_file(db, filepath, file_size_kb)) {
-        log_message("File already processed with same size, skipping.");
+        log_message("DEBUG", "File already processed with same size, skipping.");
         fclose(file);
         return;
     }
@@ -556,8 +699,11 @@ void parse_txt_file(const char *filepath) {
 unsigned long hash(const char *str);
 
 void *process_file(void *arg) {
+	pthread_mutex_lock(&file_mutex);
     thread_data_t *data = (thread_data_t *)arg;
     char *filepath = data->filepath;
+	
+	open_db(&db);
 
     if (strstr(filepath, ".txt")) {
         parse_txt_file(filepath);
@@ -568,44 +714,70 @@ void *process_file(void *arg) {
     } else if (strstr(filepath, ".doc") || strstr(filepath, ".docx")) {
         parse_doc_file(filepath);
     }
+	
+	close_db(db);
 
     // Elimina il file dopo la lavorazione
     delete_file(filepath);
+	pthread_mutex_unlock(&file_mutex);
 
     free(data);
     pthread_exit(NULL);
 }
 
 void parse_pdf_file(const char *filepath) {
+    // Create a temporary directory for image files
     char temp_dir[1024];
     snprintf(temp_dir, sizeof(temp_dir), "%s/%lx", TEMP_IMAGE_DIR, hash(filepath));
-    // mkdir(temp_dir, 0777);
     if (mkdir(temp_dir, 0777) != 0) {
-        perror("Error creating temp directory");
-    return;
+        if (errno != EEXIST) {
+            perror("Error creating temp directory");
+            return;
+        } else {
+            printf("Directory already exists: %s\n", temp_dir);
+        }
     } else {
         printf("Created directory: %s\n", temp_dir);
     }
 
+    // Check if the PDF file exists
+    if (access(filepath, F_OK) != 0) {
+        fprintf(stderr, "File %s does not exist. Cannot process PDF.\n", filepath);
+        return;
+    }
+
+    // Convert PDF to images
     char command[1024];
-    snprintf(command, sizeof(command), "pdftoppm '%s' %s/outputfile -png", filepath, temp_dir);
+    // snprintf(command, sizeof(command), "pdftoppm '%s' %s/outputfile -png", filepath, temp_dir);
+	snprintf(command, sizeof(command), "pdftoppm -png -r 96 '%s' '%s/outputfile'", filepath, temp_dir);
     int ret = system(command);
     if (ret != 0) {
         perror("Error executing pdftoppm");
         return;
     }
 
+    // Allocate memory for extracted text
     char *text = malloc(1);
+    if (text == NULL) {
+        perror("Memory allocation failed");
+        return;
+    }
     text[0] = '\0';
     size_t text_size = 1;
 
-    for (int i = 1; i <= 100; i++) {
+    for (int i = 1; i <= 500; i++) {
         char image_file[1024];
-        snprintf(image_file, sizeof(image_file), "%s/outputfile-%d.png", temp_dir, i);
 
+        // Try format with three digits (outputfile-001.png)
+        snprintf(image_file, sizeof(image_file), "%s/outputfile-%03d.png", temp_dir, i);
+
+        // If the file doesn't exist, try format with two digits (outputfile-01.png)
         if (access(image_file, F_OK) == -1) {
-            printf("Image file %s does not exist, stopping.\n", image_file);
-            break;
+            snprintf(image_file, sizeof(image_file), "%s/outputfile-%02d.png", temp_dir, i);
+            if (access(image_file, F_OK) == -1) {
+                printf("Image file %s does not exist, stopping.\n", image_file);
+                break; // Stop if neither format exists
+            }
         }
 
         printf("Processing image: %s\n", image_file);
@@ -627,50 +799,67 @@ void parse_pdf_file(const char *filepath) {
             continue;
         }
 
+        // Read OCR output and concatenate to text
         char buffer[1024];
         while (fgets(buffer, sizeof(buffer), file) != NULL) {
             size_t buffer_length = strlen(buffer);
             text_size += buffer_length;
-            text = realloc(text, text_size);
+            char *new_text = realloc(text, text_size);
+            if (new_text == NULL) {
+                perror("Memory reallocation failed");
+                free(text);
+                fclose(file);
+                return;
+            }
+            text = new_text;
             strcat(text, buffer);
         }
-
         fclose(file);
 
-        // Log del testo estratto da ogni immagine
-        printf("Extracted text from image %d: %s\n", i, text);
+        // Log the extracted text from each image
+        // printf("Extracted text from image %d: %s\n", i, text);
     }
 
+    // If no text was extracted, skip saving to the database
     if (strlen(text) == 0) {
         printf("No text extracted from %s, skipping database save.\n", filepath);
         free(text);
         return;
     }
 
-    // Logging prima di salvare nel database
-    printf("Final extracted text size: %lu characters\n", strlen(text));
-    printf("Final extracted text: %s\n", text);
+    // Logging before saving to the database
+	log_message("INFO", "Final extracted text size: %lu characters",  strlen(text));
+    log_message("DEBUG", "Final extracted text: %s", text);
 
+    // Get file attributes
     struct stat attr;
-    stat(filepath, &attr);
+    if (stat(filepath, &attr) != 0) {
+        perror("Error getting file attributes");
+        free(text);
+        // return;
+    }
     char last_modified_time[20];
     strftime(last_modified_time, sizeof(last_modified_time), "%Y-%m-%d %H:%M:%S", localtime(&(attr.st_mtime)));
 
     int file_size_kb = attr.st_size / 1024;
 
+    // Get current time for operation time
     time_t now = time(NULL);
     char operation_time[20];
     strftime(operation_time, sizeof(operation_time), "%Y-%m-%d %H:%M:%S", localtime(&now));
 
+    // Save text to database
     int save_result = save_to_db(db, filepath, text, operation_time, last_modified_time, file_size_kb);
     if (save_result == 0) {
-        printf("Text successfully saved to database for file %s.\n", filepath);
+        log_message("INFO", "Text successfully saved to database for file %s.", filepath);
     } else {
-        printf("Failed to save text to database for file %s.\n", filepath);
+		log_message("ERROR", "Failed to save text to database for file %s.", filepath);
     }
 
+    // Free allocated memory
     free(text);
 
+    // Clean up temporary directory
     char remove_command[1024];
     snprintf(remove_command, sizeof(remove_command), "rm -rf %s", temp_dir);
     system(remove_command);
@@ -688,7 +877,7 @@ unsigned long hash(const char *str) {
 
 
 void parse_rtf_file(const char *filepath) {
-    log_message("Parsing RTF file...");
+    log_message("INFO", "Parsing RTF file...");
 
     // Comando per estrarre il testo da un file RTF usando unrtf
     char command[1024];
@@ -731,7 +920,7 @@ void parse_rtf_file(const char *filepath) {
 
 
 void parse_doc_file(const char *filepath) {
-    log_message("Parsing DOC/DOCX file...");
+    log_message("INFO", "Parsing DOC/DOCX file...");
 
     char command[1024];
     char *text = NULL;
@@ -750,7 +939,7 @@ void parse_doc_file(const char *filepath) {
 
     // Verifica se l'estensione è valida (doc o docx)
     if (strstr(filepath, ".docx") == NULL && strstr(filepath, ".doc") == NULL) {
-        log_message("Unsupported file extension, skipping file.");
+        log_message("DEBUG", "Unsupported file extension, skipping file.");
         return;
     }
 
@@ -811,47 +1000,132 @@ void parse_doc_file(const char *filepath) {
 
     int save_result = save_to_db(db, filepath, text, operation_time, last_modified_time, file_size_kb);
     if (save_result == 0) {
-        log_message("Text successfully saved to database.");
+        log_message("INFO", "Text successfully saved to database.");
     } else {
-        log_message("Failed to save text to database.");
+        log_message("ERROR", "Failed to save text to database.");
     }
 
     free(text);  // Libera la memoria allocata per text
 }
 
-
-
-int has_valid_extension(const char *filename) {
-    return strstr(filename, ".txt") || strstr(filename, ".rtf") || 
-           strstr(filename, ".pdf") || strstr(filename, ".doc") || 
-           strstr(filename, ".docx");
+int is_temp_file(const char *filename) {
+    return strstr(filename, ".part") != NULL;  // Check if the file is a temporary file (.part)
 }
 
-void log_message(const char *message) {
-    printf("%s\n", message);
+void log_message(const char *level, const char *message, ...) {
+    // Get the current time
+    time_t now = time(NULL);
+    struct tm *t = localtime(&now);
+    
+    // Prepare the timestamp in the format [YYYY-MM-DD HH:MM:SS]
+    char timestamp[20];
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", t);
+
+    // Print the log level, timestamp, and message
+    printf("[%s] [%s] ", level ? level : "INFO", timestamp);
+
+    // Handle variable arguments for the log message
+    va_list args;
+    va_start(args, message);
+    vprintf(message, args);
+    va_end(args);
+
+    // End the log line
+    printf("\n");
 }
 
 void delete_file(const char *filepath) {
-    log_message("Deleting file...");
-    if (remove(filepath) == 0) {
-        log_message("File deleted successfully.");
+    log_message("DEBUG", "Attempting to delete file...");
+
+    // Check if the file exists before attempting to delete it
+    if (access(filepath, F_OK) == 0) {
+        // File exists, attempt to delete it
+        if (remove(filepath) == 0) {
+            log_message("INFO", "File deleted successfully.");
+        } else {
+            // Log the specific error message
+            log_message("ERROR", "Error deleting file.");
+            log_message("ERROR", strerror(errno));  // Provides a textual description of the error
+        }
     } else {
-        log_message("Error deleting file.");
+        // File does not exist
+        log_message("WARNING", "File does not exist, no deletion needed.");
+    }
+}
+
+// Checks if the file has a valid extension (doc, docx, txt, pdf, rtf)
+int has_valid_extension(const char *filename) {
+    const char *valid_extensions[] = {".doc", ".docx", ".txt", ".pdf", ".rtf"};
+    int num_extensions = sizeof(valid_extensions) / sizeof(valid_extensions[0]);
+
+    for (int i = 0; i < num_extensions; i++) {
+        if (strstr(filename, valid_extensions[i]) != NULL) {
+            return 1;  // Valid extension found
+        }
+    }
+    return 0;  // No valid extension
+}
+
+typedef struct {
+    char filepath[1024];
+    bool processing;
+} FileProcessing;
+
+// Array per tenere traccia dei file in fase di elaborazione
+FileProcessing file_processing_list[MAX_FILES];
+int file_processing_count = 0;
+
+bool is_file_processing(const char *filepath) {
+    for (int i = 0; i < file_processing_count; i++) {
+        if (strcmp(file_processing_list[i].filepath, filepath) == 0) {
+            return file_processing_list[i].processing;
+        }
+    }
+    return false;
+}
+
+void mark_file_processing(const char *filepath) {
+    for (int i = 0; i < file_processing_count; i++) {
+        if (strcmp(file_processing_list[i].filepath, filepath) == 0) {
+            file_processing_list[i].processing = true;
+            return;
+        }
+    }
+    if (file_processing_count < MAX_FILES) {
+        strcpy(file_processing_list[file_processing_count].filepath, filepath);
+        file_processing_list[file_processing_count].processing = true;
+        file_processing_count++;
+    }
+}
+
+void mark_file_processed(const char *filepath) {
+    for (int i = 0; i < file_processing_count; i++) {
+        if (strcmp(file_processing_list[i].filepath, filepath) == 0) {
+            file_processing_list[i].processing = false;
+            return;
+        }
+    }
+}
+
+void remove_file_from_list(const char *filepath) {
+    for (int i = 0; i < file_processing_count; i++) {
+        if (strcmp(file_processing_list[i].filepath, filepath) == 0) {
+            // Shift all subsequent elements to the left
+            for (int j = i; j < file_processing_count - 1; j++) {
+                file_processing_list[j] = file_processing_list[j + 1];
+            }
+            file_processing_count--;
+            return;
+        }
     }
 }
 
 int main() {
 
-    if (OPENAI_API_KEY != NULL && WATCH_PATH != NULL && TEMP_IMAGE_DIR != NULL) {
-        printf("OPENAI_API_KEY: %s\n", OPENAI_API_KEY);
-        printf("WATCH_PATH: %s\n", WATCH_PATH);
-        printf("TEMP_IMAGE_DIR: %s\n", TEMP_IMAGE_DIR);
-    } else {
-        printf("Errore: variabili d'ambiente non trovate.\n");
-        return 0;
-    }
+    // Environment variable checks and initialization...
 
-    init_db(&db);  // Inizializza la connessione al database globale
+    init_db(&db);
+	close_db(db);
 
     int fd = inotify_init();
     if (fd < 0) {
@@ -859,16 +1133,17 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    int wd = inotify_add_watch(fd, WATCH_PATH, IN_CREATE);
+    int wd = inotify_add_watch(fd, WATCH_PATH, IN_CREATE | IN_MOVED_TO | IN_CLOSE_WRITE);
     if (wd == -1) {
         perror("inotify_add_watch");
         exit(EXIT_FAILURE);
     }
 
-    log_message("Started watching directory.");
+    log_message("INFO", "Started watching directory.");
     printf("Watching directory: %s\n", WATCH_PATH);
 
     char buffer[EVENT_BUF_LEN];
+
     while (1) {
         int length = read(fd, buffer, EVENT_BUF_LEN);
         if (length < 0) {
@@ -880,24 +1155,63 @@ int main() {
         while (i < length) {
             struct inotify_event *event = (struct inotify_event *)&buffer[i];
             if (event->len) {
-                if (event->mask & IN_CREATE) {
-                    char log_buffer[1024];
+                char log_buffer[1024];
+                char filepath[1024];
+
+                snprintf(filepath, sizeof(filepath), "%s/%s", WATCH_PATH, event->name);
+                printf("Detected file: %s\n", event->name);
+
+                if (is_temp_file(event->name)) {
+                    snprintf(log_buffer, sizeof(log_buffer), "Ignoring file: %s (temporary .part file)", event->name);
+                    log_message("DEBUG", log_buffer);
+                }
+                else if (event->mask & IN_CREATE) {
                     snprintf(log_buffer, sizeof(log_buffer), "New file detected: %s", event->name);
-                    log_message(log_buffer);
+                    log_message("INFO", log_buffer);
+                }
+                else if (event->mask & IN_MOVED_TO) {
+                    snprintf(log_buffer, sizeof(log_buffer), "File renamed or moved to: %s", event->name);
+                    log_message("DEBUG", log_buffer);
 
-                    char filepath[1024];
-                    snprintf(filepath, sizeof(filepath), "%s/%s", WATCH_PATH, event->name);
-
-                    if (has_valid_extension(event->name)) {
-                        snprintf(log_buffer, sizeof(log_buffer), "File %s has a valid extension. Processing...", event->name);
-                        log_message(log_buffer);
-
-                        start_thread_for_file(filepath);
-
+                    if (access(filepath, F_OK) != -1) {
+                        if (!is_file_processing(filepath)) {
+                            mark_file_processing(filepath);
+                            snprintf(log_buffer, sizeof(log_buffer), "Processing file: %s", event->name);
+                            log_message("INFO", log_buffer);
+                            start_thread_for_file(filepath);
+                        } else {
+                            snprintf(log_buffer, sizeof(log_buffer), "File %s is already being processed.", event->name);
+                            log_message("INFO", log_buffer);
+                        }
                     } else {
-                        snprintf(log_buffer, sizeof(log_buffer), "File %s does not have a valid extension. Ignoring...", event->name);
-                        log_message(log_buffer);
+                        snprintf(log_buffer, sizeof(log_buffer), "File %s not found or inaccessible.", event->name);
+                        log_message("WARNING", log_buffer);
                     }
+                }
+                else if (event->mask & IN_CLOSE_WRITE) {
+                    snprintf(log_buffer, sizeof(log_buffer), "File closed after writing: %s", event->name);
+                    log_message("DEBUG", log_buffer);
+
+                    if (is_temp_file(event->name)) {
+                        snprintf(log_buffer, sizeof(log_buffer), "Ignoring .part file after close: %s", event->name);
+                        log_message("DEBUG", log_buffer);
+                    }
+                    else if (access(filepath, F_OK) != -1 && has_valid_extension(event->name)) {
+                        snprintf(log_buffer, sizeof(log_buffer), "File %s is complete. Processing...", event->name);
+                        log_message("INFO", log_buffer);
+
+                        if (!is_file_processing(filepath)) {
+                            mark_file_processing(filepath);
+                            start_thread_for_file(filepath);
+                        }
+                    } else {
+                        snprintf(log_buffer, sizeof(log_buffer), "File %s does not have a valid extension or was not found. Ignoring...", event->name);
+                        log_message("WARNING", log_buffer);
+                    }
+
+                    // After processing is complete, remove file from the list
+                    mark_file_processed(filepath);
+                    remove_file_from_list(filepath);
                 }
             }
             i += sizeof(struct inotify_event) + event->len;
@@ -906,7 +1220,6 @@ int main() {
 
     inotify_rm_watch(fd, wd);
     close(fd);
-    sqlite3_close(db);  // Chiudi la connessione al database globale
 
     return 0;
 }
